@@ -35,7 +35,7 @@ UNITED      = Airline["UA"]
 OUTPUT_PATH = Path(__file__).parent / "flights.html"
 _EC2_HOST   = "ec2-user@54.164.139.134"
 _EC2_PEM    = Path.home() / ".ssh" / "portfolio-tracker.pem"
-_EC2_DEST   = "/usr/share/nginx/html/flights.html"
+_EC2_DEST   = "/usr/share/nginx/html/flights.html"  # served at flights.runguru.net
 _CONFIG     = Path(__file__).parent / "config.json"
 _TO_EMAIL   = "donalstar@gmail.com"
 
@@ -253,6 +253,7 @@ def build_html(all_results: dict[str, dict[str, list[dict]]],
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <title>Flights — SFO ↔ New York</title>
   <style>
     *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
