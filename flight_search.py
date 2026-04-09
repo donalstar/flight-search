@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Flight search tool — Alaska Airlines first class nonstop SFO↔JFK.
-Searches the next 2 months and generates flights.html.
+Flight search tool — SFO ↔ New York (JFK & EWR).
+Searches two cabins and generates a tabbed flights.html.
 
 Usage:
     python flight_search.py
 """
 
+import json
+import smtplib
 import subprocess
 import sys
 import time
 from datetime import date, datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
 from fli.models import (
@@ -27,16 +31,43 @@ from fli.models import (
 from fli.search import SearchDates, SearchFlights
 
 ALASKA      = Airline["AS"]
+UNITED      = Airline["UA"]
 OUTPUT_PATH = Path(__file__).parent / "flights.html"
-_EC2_HOST   = "ec2-user@44.215.215.217"
+_EC2_HOST   = "ec2-user@54.164.139.134"
 _EC2_PEM    = Path.home() / ".ssh" / "portfolio-tracker.pem"
-_EC2_DEST   = "/usr/share/nginx/html/flights"
+_EC2_DEST   = "/usr/share/nginx/html/flights.html"
+_CONFIG     = Path(__file__).parent / "config.json"
+_TO_EMAIL   = "donalstar@gmail.com"
 
 ROUTES = [
     (Airport.SFO, Airport.JFK, "SFO → JFK"),
     (Airport.SFO, Airport.EWR, "SFO → EWR"),
     (Airport.JFK, Airport.SFO, "JFK → SFO"),
     (Airport.EWR, Airport.SFO, "EWR → SFO"),
+]
+
+SEARCHES = [
+    {
+        "id":        "alaska",
+        "tab":       "Alaska Airlines — First Class",
+        "seat_type": SeatType.FIRST,
+        "airlines":  [ALASKA],
+        "desc":      "Alaska Airlines · Nonstop · First Class · 1 passenger",
+    },
+    {
+        "id":        "business",
+        "tab":       "All Airlines — Business Class",
+        "seat_type": SeatType.BUSINESS,
+        "airlines":  None,
+        "desc":      "All Airlines · Nonstop · Business Class · 1 passenger",
+    },
+    {
+        "id":        "united_pe",
+        "tab":       "United — Premium Economy",
+        "seat_type": SeatType.PREMIUM_ECONOMY,
+        "airlines":  [UNITED],
+        "desc":      "United Airlines · Nonstop · Premium Economy · 1 passenger",
+    },
 ]
 
 
@@ -48,7 +79,8 @@ def _fmt_duration(minutes: int) -> str:
     return f"{minutes // 60}h {minutes % 60}m"
 
 
-def scan_route(dep: Airport, arr: Airport, label: str) -> list[dict]:
+def scan_route(dep: Airport, arr: Airport, label: str,
+               seat_type: SeatType, airlines: list | None) -> list[dict]:
     today = date.today()
     start = today + timedelta(days=1)
     end   = today + timedelta(days=90)
@@ -62,9 +94,9 @@ def scan_route(dep: Airport, arr: Airport, label: str) -> list[dict]:
             arrival_airport=[[arr, 0]],
             travel_date=_date_str(start),
         )],
-        seat_type=SeatType.FIRST,
+        seat_type=seat_type,
         stops=MaxStops.NON_STOP,
-        airlines=[ALASKA],
+        **({"airlines": airlines} if airlines else {}),
         from_date=_date_str(start),
         to_date=_date_str(end),
     )
@@ -74,8 +106,6 @@ def scan_route(dep: Airport, arr: Airport, label: str) -> list[dict]:
         print(f"  No dates found for {label}")
         return []
 
-    # date_results is list[DatePrice]; .date is a tuple, .price is float
-    # Build base rows from date scan
     rows = []
     for dp in date_results:
         if not dp.price or dp.price <= 0:
@@ -86,7 +116,6 @@ def scan_route(dep: Airport, arr: Airport, label: str) -> list[dict]:
             "day":        d.strftime("%a"),
             "dep_time":   "—",
             "arr_time":   "—",
-            "duration":   "—",
             "flight_num": "—",
             "price":      dp.price,
         })
@@ -94,7 +123,6 @@ def scan_route(dep: Airport, arr: Airport, label: str) -> list[dict]:
     rows.sort(key=lambda r: r["price"])
     print(f"  Found {len(rows)} dates with prices — fetching details for cheapest 5...")
 
-    # Phase 2: fetch details only for the 5 cheapest dates
     for row in rows[:5]:
         print(f"    Fetching details for {row['date']}...")
         flight_filters = FlightSearchFilters(
@@ -105,9 +133,9 @@ def scan_route(dep: Airport, arr: Airport, label: str) -> list[dict]:
                 arrival_airport=[[arr, 0]],
                 travel_date=_date_str(row["date"]),
             )],
-            seat_type=SeatType.FIRST,
+            seat_type=seat_type,
             stops=MaxStops.NON_STOP,
-            airlines=[ALASKA],
+            **({"airlines": airlines} if airlines else {}),
         )
         for attempt in range(3):
             try:
@@ -117,7 +145,6 @@ def scan_route(dep: Airport, arr: Airport, label: str) -> list[dict]:
                     leg  = best.legs[0] if best.legs else None
                     row["dep_time"]   = leg.departure_datetime.strftime("%H:%M") if leg and leg.departure_datetime else "—"
                     row["arr_time"]   = leg.arrival_datetime.strftime("%H:%M")   if leg and leg.arrival_datetime   else "—"
-                    row["duration"]   = _fmt_duration(best.duration) if best.duration else "—"
                     row["flight_num"] = f"{leg.airline} {leg.flight_number}"     if leg else "—"
                     row["price"]      = best.price
                 break
@@ -131,7 +158,6 @@ def scan_route(dep: Airport, arr: Airport, label: str) -> list[dict]:
                     break
         time.sleep(8)
 
-    # rows[:5] already have details fetched; sort all by date for display
     rows = sorted(rows, key=lambda r: r["date"])
     print(f"  Done.")
     return rows
@@ -145,32 +171,22 @@ def _price_color(price: float, avg: float) -> str:
     return "#e0e0e0"
 
 
-def build_html(results_by_route: dict[str, list[dict]], generated_at: str, search_range: str = "") -> str:
+def _build_tab_sections(results_by_route: dict[str, list[dict]], no_results_msg: str) -> str:
     sections_html = ""
-
     for label, rows in results_by_route.items():
         if not rows:
             sections_html += f"""
             <section>
               <h2>{label}</h2>
-              <p class="no-results">No first class nonstop Alaska flights found.</p>
+              <p class="no-results">{no_results_msg}</p>
             </section>"""
             continue
 
-        prices = [r["price"] for r in rows if r["price"]]
-        avg    = sum(prices) / len(prices) if prices else 0
-        lo     = min(prices) if prices else 0
-        hi     = max(prices) if prices else 0
+        prices       = [r["price"] for r in rows if r["price"]]
+        avg          = sum(prices) / len(prices) if prices else 0
+        lo           = min(prices) if prices else 0
+        hi           = max(prices) if prices else 0
         cheapest_row = min(rows, key=lambda r: r["price"])
-
-        stat_html = f"""
-        <div class="stats">
-          <div class="stat"><div class="label">Dates Found</div><div class="value">{len(rows)}</div></div>
-          <div class="stat"><div class="label">Cheapest</div><div class="value" style="color:#2ecc71">${lo:,.0f}</div></div>
-          <div class="stat"><div class="label">Best Date</div><div class="value">{cheapest_row['date'].strftime('%b %-d')}</div></div>
-          <div class="stat"><div class="label">Average</div><div class="value">${avg:,.0f}</div></div>
-          <div class="stat"><div class="label">Most Expensive</div><div class="value" style="color:#e74c3c">${hi:,.0f}</div></div>
-        </div>"""
 
         rows_html = ""
         for r in rows:
@@ -179,10 +195,9 @@ def build_html(results_by_route: dict[str, list[dict]], generated_at: str, searc
                 f"<tr>"
                 f"<td>{r['date'].strftime('%b %-d, %Y')}</td>"
                 f"<td>{r['day']}</td>"
+                f"<td>{r['flight_num']}</td>"
                 f"<td>{r['dep_time']}</td>"
                 f"<td>{r['arr_time']}</td>"
-                f"<td>{r['duration']}</td>"
-                f"<td>{r['flight_num']}</td>"
                 f"<td style='color:{color};font-weight:600'>${r['price']:,.0f}</td>"
                 f"</tr>\n"
             )
@@ -190,28 +205,55 @@ def build_html(results_by_route: dict[str, list[dict]], generated_at: str, searc
         sections_html += f"""
         <section>
           <h2>{label}</h2>
-          {stat_html}
+          <div class="stats">
+            <div class="stat"><div class="label">Dates Found</div><div class="value">{len(rows)}</div></div>
+            <div class="stat"><div class="label">Cheapest</div><div class="value" style="color:#2ecc71">${lo:,.0f}</div></div>
+            <div class="stat"><div class="label">Best Date</div><div class="value">{cheapest_row['date'].strftime('%b %-d')}</div></div>
+            <div class="stat"><div class="label">Average</div><div class="value">${avg:,.0f}</div></div>
+            <div class="stat"><div class="label">Most Expensive</div><div class="value" style="color:#e74c3c">${hi:,.0f}</div></div>
+          </div>
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>Date</th><th>Day</th><th>Departs</th><th>Arrives</th>
-                  <th>Duration</th><th>Flight</th><th>Price (USD)</th>
+                  <th>Date</th><th>Day</th><th>Flight</th>
+                  <th>Departs</th><th>Arrives</th><th>Price (USD)</th>
                 </tr>
               </thead>
-              <tbody>
-                {rows_html}
-              </tbody>
+              <tbody>{rows_html}</tbody>
             </table>
           </div>
         </section>"""
+    return sections_html
+
+
+def build_html(all_results: dict[str, dict[str, list[dict]]],
+               generated_at: str, search_range: str = "") -> str:
+    tabs_html    = ""
+    panels_html  = ""
+
+    for i, search in enumerate(SEARCHES):
+        sid      = search["id"]
+        tab_label = search["tab"]
+        desc     = search["desc"]
+        active   = "active" if i == 0 else ""
+        sections = _build_tab_sections(
+            all_results[sid],
+            f"No nonstop flights found.",
+        )
+        tabs_html += f'<button class="tab {active}" onclick="switchTab(\'{sid}\')" id="tab-{sid}">{tab_label}</button>\n'
+        panels_html += f"""
+        <div class="panel {active}" id="panel-{sid}">
+          <p class="desc">{desc} · {search_range} · Departure times shown for 5 cheapest dates</p>
+          {sections}
+        </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Alaska Airlines First Class — SFO ↔ New York</title>
+  <title>Flights — SFO ↔ New York</title>
   <style>
     *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
@@ -222,8 +264,23 @@ def build_html(results_by_route: dict[str, list[dict]], generated_at: str, searc
       max-width: 960px;
       margin: 0 auto;
     }}
-    h1 {{ font-size: 1.4rem; font-weight: 600; margin-bottom: 6px; }}
-    .desc {{ font-size: 0.85rem; color: #aaa; margin-bottom: 4px; }}
+    h1 {{ font-size: 1.4rem; font-weight: 600; margin-bottom: 16px; }}
+    .tabs {{ display: flex; gap: 8px; margin-bottom: 28px; flex-wrap: wrap; }}
+    .tab {{
+      padding: 8px 18px;
+      border-radius: 8px;
+      border: 1px solid #2a2d3a;
+      background: #1a1d27;
+      color: #888;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: all .15s;
+    }}
+    .tab:hover {{ color: #e0e0e0; border-color: #444; }}
+    .tab.active {{ background: #2a2d3a; color: #e0e0e0; border-color: #555; font-weight: 600; }}
+    .panel {{ display: none; }}
+    .panel.active {{ display: block; }}
+    .desc {{ font-size: 0.82rem; color: #aaa; margin-bottom: 4px; }}
     .updated {{ font-size: 0.75rem; color: #666; margin-bottom: 32px; }}
     section {{ margin-bottom: 48px; }}
     h2 {{ font-size: 1.1rem; font-weight: 600; margin-bottom: 16px; color: #ccc; }}
@@ -260,13 +317,99 @@ def build_html(results_by_route: dict[str, list[dict]], generated_at: str, searc
   </style>
 </head>
 <body>
-  <h1>Alaska Airlines — First Class Nonstop — SFO ↔ New York</h1>
-  <p class="desc">One-way fares per route (JFK &amp; EWR) · {search_range} · Nonstop · First Class · Departure times shown for 5 cheapest dates</p>
+  <h1>Flights — SFO ↔ New York (JFK &amp; EWR)</h1>
   <div class="updated">Generated {generated_at}</div>
-  {sections_html}
+  <div class="tabs">
+    {tabs_html}
+  </div>
+  {panels_html}
+  <script>
+    function switchTab(id) {{
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+      document.getElementById('tab-' + id).classList.add('active');
+      document.getElementById('panel-' + id).classList.add('active');
+    }}
+  </script>
 </body>
 </html>
 """
+
+
+def _build_email_section(label: str, rows: list[dict]) -> str:
+    top5 = sorted(rows, key=lambda r: r["price"])[:5]
+    if not top5:
+        return f"<h3 style='color:#ccc;font-size:0.95rem;margin:20px 0 8px'>{label}</h3><p style='color:#888'>No flights found.</p>"
+    rows_html = "".join(
+        f"<tr>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #2a2d3a'>{r['date'].strftime('%b %-d, %Y')}</td>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #2a2d3a'>{r['day']}</td>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #2a2d3a'>{r['flight_num']}</td>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #2a2d3a'>{r['dep_time']}</td>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #2a2d3a'>{r['arr_time']}</td>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #2a2d3a;color:#2ecc71;font-weight:600'>${r['price']:,.0f}</td>"
+        f"</tr>"
+        for r in top5
+    )
+    return f"""
+    <h3 style='color:#ccc;font-size:0.95rem;margin:20px 0 8px'>{label}</h3>
+    <table style='width:100%;border-collapse:collapse;font-size:0.82rem'>
+      <thead><tr style='color:#888;font-size:0.7rem;text-transform:uppercase'>
+        <th style='padding:6px 10px;border-bottom:1px solid #2a2d3a;text-align:left'>Date</th>
+        <th style='padding:6px 10px;border-bottom:1px solid #2a2d3a;text-align:left'>Day</th>
+        <th style='padding:6px 10px;border-bottom:1px solid #2a2d3a;text-align:left'>Flight</th>
+        <th style='padding:6px 10px;border-bottom:1px solid #2a2d3a;text-align:left'>Departs</th>
+        <th style='padding:6px 10px;border-bottom:1px solid #2a2d3a;text-align:left'>Arrives</th>
+        <th style='padding:6px 10px;border-bottom:1px solid #2a2d3a;text-align:left'>Price</th>
+      </tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>"""
+
+
+def _build_email_html(all_results: dict[str, dict[str, list[dict]]], generated_at: str) -> str:
+    body = ""
+    for search in SEARCHES:
+        sid = search["id"]
+        body += f"<h2 style='color:#e0e0e0;font-size:1rem;margin:28px 0 4px;border-bottom:1px solid #2a2d3a;padding-bottom:8px'>{search['tab']}</h2>"
+        for label, rows in all_results[sid].items():
+            body += _build_email_section(label, rows)
+
+    return f"""
+    <div style='font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+                background:#0f1117;color:#e0e0e0;padding:24px;max-width:700px;margin:0 auto'>
+      <h1 style='font-size:1.3rem;font-weight:600;margin-bottom:4px'>Flights — SFO ↔ New York</h1>
+      <p style='font-size:0.78rem;color:#888;margin-bottom:4px'>5 cheapest fares per route · Nonstop · 1 passenger · {generated_at}</p>
+      {body}
+      <p style='margin-top:24px;font-size:0.75rem;color:#555'>
+        Full results: <a href='https://portfolio.runguru.net/flights' style='color:#4a9eff'>portfolio.runguru.net/flights</a>
+      </p>
+    </div>"""
+
+
+def _send_email(html: str, generated_at: str) -> None:
+    if not _CONFIG.exists():
+        print("  [email] No config.json found, skipping.", file=sys.stderr)
+        return
+    cfg = json.loads(_CONFIG.read_text())
+    gmail_user   = cfg.get("gmail_user", "")
+    app_password = cfg.get("gmail_app_password", "")
+    if not app_password:
+        print("  [email] gmail_app_password not set, skipping.", file=sys.stderr)
+        return
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Flights SFO↔NYC — {generated_at}"
+    msg["From"]    = gmail_user
+    msg["To"]      = _TO_EMAIL
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(gmail_user, app_password)
+            server.sendmail(gmail_user, _TO_EMAIL, msg.as_string())
+        print(f"  [email] Sent to {_TO_EMAIL}")
+    except Exception as exc:
+        print(f"  [email] Failed: {exc}", file=sys.stderr)
 
 
 def main() -> None:
@@ -275,12 +418,15 @@ def main() -> None:
     end   = today + timedelta(days=90)
     search_range = f"{start.strftime('%b %-d, %Y')} – {end.strftime('%b %-d, %Y')}"
 
-    all_results = {}
-    for dep, arr, label in ROUTES:
-        print(f"\nScanning {label}...")
-        rows = scan_route(dep, arr, label)
-        all_results[label] = rows
-        print(f"  {len(rows)} dates with flights")
+    all_results: dict[str, dict[str, list[dict]]] = {}
+    for search in SEARCHES:
+        sid = search["id"]
+        print(f"\n=== {search['tab']} ===")
+        all_results[sid] = {}
+        for dep, arr, label in ROUTES:
+            print(f"\nScanning {label}...")
+            rows = scan_route(dep, arr, label, search["seat_type"], search["airlines"])
+            all_results[sid][label] = rows
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     html = build_html(all_results, generated_at, search_range)
@@ -296,6 +442,9 @@ def main() -> None:
         print("Published to portfolio.runguru.net/flights")
     except Exception as exc:
         print(f"Failed to publish to EC2: {exc}", file=sys.stderr)
+
+    email_html = _build_email_html(all_results, generated_at)
+    _send_email(email_html, generated_at)
 
 
 if __name__ == "__main__":
