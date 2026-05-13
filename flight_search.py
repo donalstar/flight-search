@@ -55,11 +55,12 @@ SEARCHES = [
         "desc":      "Alaska Airlines · Nonstop · First Class · 1 passenger",
     },
     {
-        "id":        "business",
-        "tab":       "All Airlines — Business Class",
-        "seat_type": SeatType.BUSINESS,
-        "airlines":  None,
-        "desc":      "All Airlines · Nonstop · Business Class · 1 passenger",
+        "id":              "business",
+        "tab":             "All Airlines — Business Class",
+        "seat_type":       SeatType.BUSINESS,
+        "airlines":        None,
+        "exclude_airlines": [ALASKA],
+        "desc":            "All Airlines (excl. Alaska) · Nonstop · Business Class · 1 passenger",
     },
     {
         "id":        "united_pe",
@@ -80,7 +81,8 @@ def _fmt_duration(minutes: int) -> str:
 
 
 def scan_route(dep: Airport, arr: Airport, label: str,
-               seat_type: SeatType, airlines: list | None) -> list[dict]:
+               seat_type: SeatType, airlines: list | None,
+               exclude_airlines: list | None = None) -> list[dict]:
     today = date.today()
     start = today + timedelta(days=1)
     end   = today + timedelta(days=90)
@@ -143,6 +145,9 @@ def scan_route(dep: Airport, arr: Airport, label: str,
                 if results:
                     best = results[0]
                     leg  = best.legs[0] if best.legs else None
+                    if leg and exclude_airlines and leg.airline in exclude_airlines:
+                        row["_exclude"] = True
+                        break
                     row["dep_time"]   = leg.departure_datetime.strftime("%H:%M") if leg and leg.departure_datetime else "—"
                     row["arr_time"]   = leg.arrival_datetime.strftime("%H:%M")   if leg and leg.arrival_datetime   else "—"
                     row["flight_num"] = f"{leg.airline} {leg.flight_number}"     if leg else "—"
@@ -157,6 +162,9 @@ def scan_route(dep: Airport, arr: Airport, label: str,
                     print(f"    Error: {exc}")
                     break
         time.sleep(8)
+
+    if exclude_airlines:
+        rows = [r for r in rows if not r.get("_exclude")]
 
     rows = sorted(rows, key=lambda r: r["date"])
     print(f"  Done.")
@@ -426,7 +434,7 @@ def main() -> None:
         all_results[sid] = {}
         for dep, arr, label in ROUTES:
             print(f"\nScanning {label}...")
-            rows = scan_route(dep, arr, label, search["seat_type"], search["airlines"])
+            rows = scan_route(dep, arr, label, search["seat_type"], search["airlines"], search.get("exclude_airlines"))
             all_results[sid][label] = rows
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
