@@ -123,9 +123,9 @@ def scan_route(dep: Airport, arr: Airport, label: str,
         })
 
     rows.sort(key=lambda r: r["price"])
-    print(f"  Found {len(rows)} dates with prices — fetching details for cheapest 5...")
+    print(f"  Found {len(rows)} dates with prices — fetching details for cheapest 10...")
 
-    for row in rows[:5]:
+    for row in rows[:10]:
         print(f"    Fetching details for {row['date']}...")
         flight_filters = FlightSearchFilters(
             trip_type=TripType.ONE_WAY,
@@ -252,7 +252,7 @@ def build_html(all_results: dict[str, dict[str, list[dict]]],
         tabs_html += f'<button class="tab {active}" onclick="switchTab(\'{sid}\')" id="tab-{sid}">{tab_label}</button>\n'
         panels_html += f"""
         <div class="panel {active}" id="panel-{sid}">
-          <p class="desc">{desc} · {search_range} · Departure times shown for 5 cheapest dates</p>
+          <p class="desc">{desc} · {search_range} · Departure times shown for 10 cheapest dates</p>
           {sections}
         </div>"""
 
