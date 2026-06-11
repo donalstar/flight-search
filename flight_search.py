@@ -57,7 +57,7 @@ SEARCHES = [
     {
         "id":              "business",
         "tab":             "All Airlines — Business Class",
-        "seat_type":       SeatType.BUSINESS,
+        "seat_type":       SeatType.FIRST,
         "airlines":        None,
         "exclude_airlines": [ALASKA],
         "desc":            "All Airlines (excl. Alaska) · Nonstop · Business Class · 1 passenger",
